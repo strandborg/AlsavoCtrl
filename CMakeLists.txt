@@ -8,6 +8,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 add_executable(AlsavoCtrl AlsavoCtrl.cpp MD5.cpp loguru.cpp)
 
 IF(UNIX)
-    target_link_libraries(AlsavoCtrl pthread atomic)
+    target_link_libraries(AlsavoCtrl pthread atomic dl)
 ENDIF(UNIX)
 

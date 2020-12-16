@@ -30,21 +30,16 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #define htonll(x) ((((uint64_t)htonl(x)) << 32) + htonl((x) >> 32))
+#define HIBYTE(w)           ((unsigned char)((uint32_t)(w) >> 8))
 #endif
-
-enum class Command
-{
-	Listen = 0,
-	Set,
-	Relax // Power off for 3 seconds, then back on
-};
 
 static std::string s_ServerAddr{"47.254.157.150"};
 static int s_ServerPort{51192};
 static std::string s_SerialNumber;
 static std::string s_Password;
-static Command s_Command{ Command::Listen };
-
+static bool s_Listen = false;
+static int s_ConfigIndex = -1;
+static int s_ConfigValue = -1;
 #pragma pack(1)
 struct PacketHeader
 {
@@ -251,7 +246,29 @@ public:
 		sendto(m_Sock, (char *)outBuf.data(), (int)outBuf.size(), 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
 	}
 
+private:
+	int RecvWithTimeout(char* rcvBuf, int bufSize, int timeoutMS)
+	{
+#ifdef _MSC_VER
+		TIMEVAL timeout;
+#else
+		struct timeval timeout;
+#endif
+		timeout.tv_sec = 0;
+		timeout.tv_usec = timeoutMS * 1000;
+		fd_set readSet;
+		FD_ZERO(&readSet);
+		FD_SET(m_Sock, &readSet);
+		int act = select(FD_SETSIZE, &readSet, NULL, NULL, &timeout);
+		if (act <= 0)
+			return 0;
 
+		sockaddr_in rcvAddr;
+		int rcvLen = sizeof(sockaddr_in);
+		int bytesReceived = recvfrom(m_Sock, rcvBuf, bufSize, 0, (sockaddr*)&rcvAddr, (socklen_t*)&rcvLen);
+		return bytesReceived;
+	}
+public:
 	bool Connect()
 	{
 		m_IsConnected = false;
@@ -272,18 +289,29 @@ public:
 		m_Sock = socket(AF_INET, SOCK_DGRAM, 0);
 
 		char rcvBuf[512];
-		sockaddr_in rcvAddr;
-		int rcvLen = sizeof(sockaddr_in);
 
 		LOG_F(INFO, "Connecting to %s:%d...", s_ServerAddr.c_str(), s_ServerPort);
 
 		AuthIntro intro(m_ClientToken, m_SerialQ);
 		sendto(m_Sock, (const char*)&intro, 56, 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
 
-		rcvLen = sizeof(sockaddr_in);
-		int bytesReceived = recvfrom(m_Sock, rcvBuf, 512, 0, (sockaddr*)&rcvAddr, (socklen_t*)&rcvLen);
+		int bytesReceived = RecvWithTimeout(rcvBuf, sizeof(rcvBuf), 2000);
+
+		if (bytesReceived == 0)
+		{
+			LOG_F(ERROR, "Server not responding, disconnecting");
+			Disconnect();
+			return false;
+		}
 
 		AuthChallenge* challenge = (AuthChallenge*)rcvBuf;
+
+		if (!(challenge->act1 == 3 && challenge->act2 == 0 && challenge->act3 == 0 && challenge->act4 == 0))
+		{
+			LOG_F(ERROR, "Invalid auth challenge packet (pump offline?), disconnecting");
+			Disconnect();
+			return false;
+		}
 
 		m_CSID = challenge->hdr.csid;
 		m_DSID = challenge->hdr.dsid;
@@ -304,9 +332,23 @@ public:
 		AuthResponse resp(m_CSID, m_DSID, respdata);
 		sendto(m_Sock, (const char*)&resp, sizeof(resp), 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
 
-		rcvLen = sizeof(sockaddr_in);
-		bytesReceived = recvfrom(m_Sock, rcvBuf, 512, 0, (sockaddr*)&rcvAddr, (socklen_t *)&rcvLen);
+		bytesReceived = RecvWithTimeout(rcvBuf, sizeof(rcvBuf), 2000);
 
+		if (bytesReceived == 0)
+		{
+			LOG_F(ERROR, "Server not responding to auth response, disconnecting");
+			Disconnect();
+			return false;
+		}
+
+		uint32_t act = *(uint32_t*)(&rcvBuf[sizeof(PacketHeader)]);
+		if (act != 0x00000005)
+		{
+			LOG_F(ERROR, "Server returned error in auth, disconnecting");
+			Disconnect();
+			return false;
+
+		}
 		m_IsConnected = true;
 		m_LastPacketRcvTime = std::chrono::system_clock::now();
 
@@ -314,8 +356,42 @@ public:
 
 		LOG_F(INFO, "Connection complete.");
 
-//		SendPacket({ 8, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0 });
-		QueryAll();
+		if (s_ConfigIndex != -1 && s_ConfigValue != -1)
+		{
+			SetConfig(s_ConfigIndex, s_ConfigValue);
+		}
+
+		// These packets seem to make the heat pump send periodic updates, no idea which one of these does it
+		SendPacket({ 8, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0 });
+
+        SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x0c, 0, 7, 0, 4, 0, 1, 0, 0 });
+
+		SendPacket({ 8, 3, 0, 0, 0, 1, 0, 7, 0, 2, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0, 0, 1, 0, 3, 0, 0x64, 0, 0});
+
+		SendPacket({ 8, 1, 0, 0, 0, 9, 0, 1, 0, 1, 0, 0 });
+
+		SendPacket({ 0x08, 0x13, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x64, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x04, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x05, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x05, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x08, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x03, 0x00, 0x09, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00,
+0x00, 0x01, 0x00, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00,
+0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00
+			});
+
+		SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x2e, 0xff, 0xff, 0, 0 });
+
+		SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0 });
+
+		SendPacket({ 8, 1, 0, 0, 0, 1, 0, 5, 0, 3, 0, 0 });
+
+		SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 3, 0, 0 });
+
+//		QueryAll();
 
 		return true;
 	}
@@ -338,6 +414,15 @@ public:
 		}
 	}
 
+	void SetConfig(int16_t idx, int16_t val)
+	{
+		unsigned char idxH = HIBYTE(idx);
+		unsigned char idxL = idx & 0xff;
+		unsigned char valH = HIBYTE(val);
+		unsigned char valL = val & 0xff;
+		SendPacket({9, 1, 0, 0, 0, 2, 0, 0x2e, 0, 2, 0, 0x4, idxH, idxL, valH, valL });
+	}
+
 	void QueryAll()
 	{
 		SendPacket({8, 1, 0, 0, 0, 2, 0, 0x2e, 0xff, 0xff, 0, 0});
@@ -350,14 +435,14 @@ public:
 		{
 			auto now = std::chrono::system_clock::now();
 			auto diff = std::chrono::duration<double>(now - m_LastPacketRcvTime.load());
-			if (diff.count() > 5.0)
+			if (diff.count() > 6.0)
 			{
-				LOG_F(INFO, "No packets received in 5 seconds, sending keepalive query packet...");
+//				LOG_F(INFO, "No packets received in 6 seconds, sending keepalive query packet...");
 				// Send a keepalive packet
 //				SendPacket({ 8, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0 });
 				QueryAll();
 			}
-			if (diff.count() > 10.0)
+			if (diff.count() > 20.0)
 			{
 				LOG_F(ERROR, "Connection timed out, disconnecting.");
 				Disconnect();
@@ -368,6 +453,7 @@ public:
 
 		if (!isConnected())
 		{
+			Disconnect();
 			Connect();
 		}
 
@@ -602,7 +688,13 @@ public:
 			if(cmd == 0x0b)
 				m_Session.SendReply({ 0x0b, 0x01, 0, 0, 0, 2, 0, 0x2e, 0, 1, 0, 0 }, hdr->seq);
 		}
-		
+
+		if (cmd == 0x09 && !s_Listen)
+		{
+			// Quit once we get the answer to param setting command and we're not in listening mode
+			exit(0);
+		}
+
 		//		printf("Default handler: ");
 //		printPacket((char*)packet.data(), byteCount);
 
@@ -633,15 +725,15 @@ int main(int argc, char **argv)
 {
 	CLI::App app{"Alsavo heat pump control"};
 	std::string logFile{};
-	std::map<std::string, Command> commandMap{ {"Listen", Command::Listen},{"Set", Command::Set},{"Relax", Command::Relax} };
 
 	app.add_option("-s,--serial", s_SerialNumber, "Serial number string of the heat pump")->required();
 	app.add_option("-l,--password", s_Password, "Password")->required();
 	app.add_option("-a,--address", s_ServerAddr, "Override server address, defaults to 47.254.157.150");
 	app.add_option("-p,--port", s_ServerPort, "Override server port, default 51194");
-	app.add_option("-c,--cmd", s_Command, "Command; either 'Listen' (default), 'Set', or 'Relax' (case insensitive)")
-		->transform(CLI::CheckedTransformer(commandMap, CLI::ignore_case));
+	app.add_flag("--listen", s_Listen, "Keep listening for status updates");
 	app.add_option("-g,--logfile", logFile, "Write log to file");
+	app.add_option("conf_idx", s_ConfigIndex, "Config index to write");
+	app.add_option("value", s_ConfigValue, "Value to write");
 
 	CLI11_PARSE(app, argc, argv);
 
