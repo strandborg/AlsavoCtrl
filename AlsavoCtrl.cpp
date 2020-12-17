@@ -686,7 +686,7 @@ public:
 			}
 
 			if(cmd == 0x0b)
-				m_Session.SendReply({ 0x0b, 0x01, 0, 0, 0, 2, 0, 0x2e, 0, 1, 0, 0 }, hdr->seq);
+				m_Session.SendReply({ 0x0b, 0x01, 0, 0, 0, 2, 0, 0x2e, 0, payload[9], 0, 0 }, hdr->seq);
 		}
 
 		if (cmd == 0x09 && !s_Listen)
