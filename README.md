@@ -5,7 +5,7 @@ This command-line tool can be used to control pool heat pumps manufactured by Ze
 
 # Usage
 ```
-Usage: /etc/openhab2/AlsavoCtrl [OPTIONS] [conf_idx] [value]
+Usage: AlsavoCtrl [OPTIONS] [conf_idx] [value]
 
 Positionals:
   conf_idx INT                Config index to write
@@ -20,6 +20,8 @@ Options:
   --listen                    Keep listening for status updates
   -g,--logfile TEXT           Write log to file
   ```
+
+Running AlsavoCtrl without config_idx and value will query the current status and config values as JSON and exit. 
 
 # Known status and config parameter indices
 
