@@ -1,6 +1,44 @@
 
 In LAN mode, the heat pump answers to UDP port 1194. In global mode, server IP is 47.254.157.150 and UDP port 51192
 
+All traffic is in big endian.
+
+Packet header format:
+int8    header code: 0x32 = request, 0x30 = reply to an earlier request of the same sequence number
+int8    padding
+int8    sequence number (monotonically increasing once session has been set up, otherwise 0)
+int32   csid (session identifier, provided by server at login)
+int32   dsid (device identifier, provided by server at login)
+int16   command category: 0xf2 = login and authentication messages, 0xf3 = status and keepalive, 0xf4 = normal commands once session has been set update
+int16   payload length in bytes (the length of the rest of the packet)
+int8    "action" = command. 8 = Object query, 9 = set object value, 7 = connection reset (cmd == 0xf3 in this case), 0xb = status update from server (initiated by the server, client needs to reply)
+
+
+Different payloads:
+1, 2, 3, 4, 5: Authentication messages. Look into source code to see the contents.
+
+8: object query / response
+===============
+int8    action = 8
+int8    number of objects to query / respond to
+int16   pad
+<object payloads, starting with object header>
+
+Object header:
+int32 object type: only known one is 0x0002002e for status/config data.
+int16 object subtype: for status/configs 1 = status, 2 = configs, 3 = deviceInfo?, 0xffff queries for all params and configs.
+int16 object payload size. For queries this is 0, responses have payload data after this one.
+
+For param/config data the object payload layout:
+int16 startIdx
+int16 numIndices
+<numIndices x int16> parameter values. See below for param/config indices
+
+0xb: Status update
+===================
+Layout identical to command 8, except that this is sent periodically by the server, containing status params (basically 0xb, 1, 0, 0, followed by object header for 0x0002002e with subtype 1)
+
+
 
 Status params:
 
@@ -38,7 +76,6 @@ All temperature values are in tenths of a Celsius, for example a value of -123 m
 
 Config params:
 
-0 = Unknown, maybe defrost?
 1 = Heating mode target temp
 2 = Cooling mode target temp
 3 = Auto mode target temp
@@ -71,6 +108,6 @@ Bit 6:      Debug mode (0 = auto, 1 = manual config C6, C7, C8 in effect)
 Bit 7:      Timer off enabled
 
 Sys config 2:
-Bit 0:
-Bit 1:      Reset to factory settings
+Bit 0:      Manual Defrost
+Bit 1:      Reset to factory settings OR set Valve mode, you'll never know!
 Bit 2:
