@@ -20,6 +20,7 @@
 #include <chrono>
 #include "CLI11.hpp"
 #include "loguru.hpp"
+#include <math.h>
 
 #ifdef _MSC_VER
 #include "winsock2.h"
@@ -38,7 +39,7 @@ static int s_ServerPort{51192};
 static std::string s_SerialNumber;
 static std::string s_Password;
 static bool s_Listen = false;
-static bool s_Silence = true;
+static bool s_Silence = false;
 static int s_ConfigIndex = -1;
 static int s_ConfigValue = -1;
 #pragma pack(1)
@@ -579,17 +580,28 @@ public:
 	std::set<int> m_TemperatureStatusIndices{ 16, 17, 18, 19, 20, 21, 23, 24, 55, 56 };
 	std::chrono::time_point<std::chrono::system_clock> m_PrevKeepaliveSendTime;
 
+	std::chrono::time_point<std::chrono::system_clock> m_SilenceOffSendTime;
+
 	Runner()
 		: m_Session	()
 	{
+		m_CurrConfigs.resize(64);
+		m_CurrStatuses.resize(70);
 	}
 
 	bool m_OperationsDone = false;
+	std::vector<int> m_CurrConfigs;
+	std::vector<int> m_CurrStatuses;
 
 	void HandleParamBlock(ParamBlock* block, bool isConfigs)
 	{
 		int startIdx = ntohs(block->startIdx);
 		int numParams = ntohs(block->numParams);
+		if (isConfigs && numParams + startIdx > m_CurrConfigs.size())
+			m_CurrConfigs.resize(numParams + startIdx);
+		if (!isConfigs && numParams + startIdx > m_CurrStatuses.size())
+			m_CurrStatuses.resize(numParams + startIdx);
+
 
 		for (int i = startIdx; i < startIdx + numParams; ++i)
 		{
@@ -598,10 +610,12 @@ public:
 				continue;
 			if(isConfigs)
 			{
+				m_CurrConfigs[i] = valInt;
 				printf("{\"type\":\"config\", \"index\":%d, \"value\":%d}\n", i, valInt);
 			}
 			else
 			{
+				m_CurrStatuses[i] = valInt;
 				if (m_TemperatureStatusIndices.find(i) != m_TemperatureStatusIndices.end())
 				{
 					float fval = ((float)valInt) / 10.0f;
@@ -636,40 +650,21 @@ public:
 		{
 			// Status packet, parse objects
 			auto objectCount = payload[1];
-			QueryObject* obj = (QueryObject *)&payload[4];
+			QueryObject* obj = (QueryObject*)&payload[4];
 			for (int i = 0; i < objectCount; ++i)
 			{
 				ParseObject(obj);
 				int16_t dataSize = ntohs(obj->dataSize);
-				obj = (QueryObject*)(((char *)obj)+dataSize + 8);
+				obj = (QueryObject*)(((char*)obj) + dataSize + 8);
 			}
 
 			if (cmd == 0x0b)
 			{
-				if(!s_Listen)
-					m_Session.SendPacketNow({ 7, 0, 0, 0 }, hdr->seq, true, 0xf3);
-				else
-					m_Session.SendPacketNow({ 0x0b, 0x01, 0, 0, 0, 2, 0, 0x2e, 0, payload[9], 0, 0 }, hdr->seq, true);
+				m_Session.SendPacketNow({ 0x0b, 0x01, 0, 0, 0, 2, 0, 0x2e, 0, payload[9], 0, 0 }, hdr->seq, true);
 			}
-
-/*			if (!s_Listen && cmd == 0x08 && objectCount == 3) // We got reply to query all and we're not in listen mode, quit.
-			{
-				// Disconnect
-				m_OperationsDone = true;
-			}*/
 		}
-
-/*		if (cmd == 0x09 && !s_Listen)
-		{
-			// Quit once we get the answer to param setting command and we're not in listening mode
-			exit(0);
-		}
-		*/
-		//		printf("Default handler: ");
-//		printPacket((char*)packet.data(), byteCount);
-
 	}
-
+	bool m_SilenceCommandSent = false;
 
 	int main()
 	{
@@ -693,57 +688,51 @@ public:
 		m_Session.QueryAll([this](const std::vector<unsigned char>& packet, int byteCount)
 			{
 				DefaultHandler(packet, byteCount);
-//				if (!s_Listen)
-//					m_OperationsDone = true;
+				if (s_Silence)
+				{
+					float currTemp = ((float)m_CurrStatuses[16]) / 10.0f;
+					float tgtTemp = roundf(currTemp) + 1.0f;
+					LOG_F(INFO, "Setting temperature and turning off heater (conf 4 to %d)", m_CurrConfigs[4] & 0xFFDF);
+					m_Session.SetConfig(1, (int16_t)(tgtTemp * 10.0f), [this](const std::vector<unsigned char>& packet, int byteCount) {	DefaultHandler(packet, byteCount); });
+					m_Session.SetConfig(4, m_CurrConfigs[4] & 0xFFDF, [this](const std::vector<unsigned char>& packet, int byteCount) {	DefaultHandler(packet, byteCount); });
+					m_SilenceOffSendTime = std::chrono::system_clock::now();
+					m_SilenceCommandSent = true;
+				}				
+				else if (!s_Listen)
+					m_OperationsDone = true;
 			});
+		std::chrono::duration<float, std::milli> silenceTimeout{ 2500.0f };
 
-		/*
-		if (s_Listen)
-		{
-			// These packets seem to make the heat pump send periodic updates, no idea which one of these does it
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x0c, 0, 7, 0, 4, 0, 1, 0, 0 });
-
-			SendPacket({ 8, 3, 0, 0, 0, 1, 0, 7, 0, 2, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0, 0, 1, 0, 3, 0, 0x64, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 9, 0, 1, 0, 1, 0, 0 });
-
-			SendPacket({ 0x08, 0x13, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x64, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x04, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x05, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x05, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x08, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x03, 0x00, 0x09, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00,
-	0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00
-				});
-
-			SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x2e, 0xff, 0xff, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 5, 0, 3, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 3, 0, 0 });
-		}
-		else
-			QueryAll();
-			*/
 
 		std::chrono::duration<float, std::milli> keepaliveTimeout{ 2000.0f };
 
 		while(!m_OperationsDone && (m_Session.GetConnectionStatus() == AlsavoSession::ConnectionStatus::Connected))
 		{
 			m_Session.Pump();
+
+			if (s_Silence && m_SilenceCommandSent)
+			{
+				if (std::chrono::system_clock::now() - m_SilenceOffSendTime > silenceTimeout)
+				{
+					LOG_F(INFO, "Restarting heater");
+					m_SilenceCommandSent = false;
+					m_Session.SetConfig(4, m_CurrConfigs[4] | 0x20, [this](const std::vector<unsigned char>& packet, int byteCount) {	DefaultHandler(packet, byteCount); });
+					m_Session.QueryAll([this](const std::vector<unsigned char>& packet, int byteCount)
+						{
+							DefaultHandler(packet, byteCount);
+							if (!s_Listen)
+								m_OperationsDone = true;
+						});
+				}
+			}
+
+/* KEEPALIVE PACKETS, they don't seem to do anything
+
 			if (std::chrono::system_clock::now() - m_PrevKeepaliveSendTime > keepaliveTimeout)
 			{
 				m_Session.SendPacket({ 1, 0, 0, 0 }, [](const std::vector<unsigned char>& packet, int byteCount) {}, 0xf3);
 				m_PrevKeepaliveSendTime = std::chrono::system_clock::now();
-			}
+			}*/
 		}
 		m_Session.Disconnect();
 
@@ -761,7 +750,7 @@ int main(int argc, char **argv)
 	app.add_option("-l,--password", s_Password, "Password")->required();
 	app.add_option("-a,--address", s_ServerAddr, "Override server address, defaults to 47.254.157.150");
 	app.add_option("-p,--port", s_ServerPort, "Override server port, default 51194");
-	app.add_flag("--listen", s_Listen, "Keep listening for status updates");
+	app.add_flag("--listen", s_Listen, "Keep listening for status updates, not very reliable");
 	app.add_flag("--silence", s_Silence, "Tap the brakes; set target temp to the current water out temp (rounded to nearest C) + 1, send power off + wait 2.5 seconds + power on");
 	app.add_option("-g,--logfile", logFile, "Write log to file");
 	app.add_option("conf_idx", s_ConfigIndex, "Config index to write");
