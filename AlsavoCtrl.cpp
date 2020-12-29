@@ -38,6 +38,7 @@ static int s_ServerPort{51192};
 static std::string s_SerialNumber;
 static std::string s_Password;
 static bool s_Listen = false;
+static bool s_Silence = true;
 static int s_ConfigIndex = -1;
 static int s_ConfigValue = -1;
 #pragma pack(1)
@@ -191,62 +192,51 @@ static void printPacket(char* pkt, int len)
 class AlsavoSession
 {
 public:
-	AlsavoSession(const std::string serial, const std::string passwd)
-		: m_SerialNo(serial), m_Password(passwd), m_LastPacketRcvTime(std::chrono::system_clock::now())
+	enum class ConnectionStatus
+	{
+		Disconnected = 0,
+		Connected = 1
+	};
+
+	ConnectionStatus GetConnectionStatus() const { return m_ConnectionStatus; }
+
+	AlsavoSession()
+		: m_LastPacketRcvTime(std::chrono::system_clock::now())
+		, m_ConnectionStatus(ConnectionStatus::Disconnected)
 	{
 #ifdef _MSC_VER
 		WSADATA wsadata;
 		WSAStartup(MAKEWORD(2, 2), &wsadata);
 #endif
-		srand((uint32_t)time(NULL));
-
-		MD5_CTX ctx;
-		MD5_Init(&ctx);
-		MD5_Update(&ctx, (char*)m_Password.c_str(), (unsigned int)m_Password.length());
-		MD5_Final(m_HashedPW, &ctx);
-
-		memset(&m_DestAddr, 0, sizeof(sockaddr_in));
-		m_DestAddr.sin_family = AF_INET;
-		m_DestAddr.sin_port = htons(s_ServerPort);
-		inet_pton(AF_INET, s_ServerAddr.c_str(), &m_DestAddr.sin_addr);
-		int64_t s = atoll(serial.c_str());
-		m_SerialQ = htonll(s);
 	}
 
 	~AlsavoSession()
 	{
-		if (m_WorkerThread.joinable())
-		{
-			m_Dying = true;
-			m_WorkerThread.join();
-		}
 #ifdef _MSC_VER
 		WSACleanup();
 #endif
 	}
 
-	void SendPacket(const std::vector<unsigned char> &payload, uint16_t cmd = 0xf4, bool sendNow = false)
+	typedef std::function<void(const std::vector<unsigned char>&, int)> PacketResponseCB;
+
+	void SendPacket(const std::vector<unsigned char> &payload, PacketResponseCB onResponse, uint16_t cmd = 0xf4)
 	{
 		std::vector<unsigned char> outBuf;
 		outBuf.resize(sizeof(PacketHeader) + payload.size());
 		PacketHeader hdr(0x32, 0, m_CSID, m_DSID, cmd, (uint16_t)payload.size());
 		memcpy(outBuf.data(), &hdr, sizeof(PacketHeader));
 		memcpy(outBuf.data() + sizeof(PacketHeader), payload.data(), (uint16_t)payload.size());
-		std::lock_guard<std::recursive_mutex> lock(m_QueueLock);
-		if(sendNow)
-			sendto(m_Sock, (char*)outBuf.data(), (int)outBuf.size(), 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
-		else
-			m_OutQueue.push_back(std::move(outBuf));
+		m_OutQueue.emplace_back(std::move(outBuf), onResponse);
 	}
-	void SendReply(const std::vector<unsigned char>& payload, uint16_t seq, uint16_t cmd = 0xf4)
+
+	void SendPacketNow(const std::vector<unsigned char>& payload, uint16_t seq, bool isReply = false, uint16_t cmd = 0xf4)
 	{
 		std::vector<unsigned char> outBuf;
 		outBuf.resize(sizeof(PacketHeader) + payload.size());
-		PacketHeader hdr(0x30, seq, m_CSID, m_DSID, cmd, (uint16_t)payload.size());
+		PacketHeader hdr(isReply ? 0x30 : 0x32, seq, m_CSID, m_DSID, cmd, (uint16_t)payload.size());
 		memcpy(outBuf.data(), &hdr, sizeof(PacketHeader));
 		memcpy(outBuf.data() + sizeof(PacketHeader), payload.data(), (uint16_t)payload.size());
-		std::lock_guard<std::recursive_mutex> lock(m_QueueLock);
-		sendto(m_Sock, (char *)outBuf.data(), (int)outBuf.size(), 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
+		sendto(m_Sock, (char*)outBuf.data(), (int)outBuf.size(), 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
 	}
 
 private:
@@ -272,39 +262,44 @@ private:
 		return bytesReceived;
 	}
 public:
-	bool Connect()
+	void Connect(const std::string serverIP, int16_t serverPort, const std::string &serial, const std::string &passwd)
 	{
-		m_IsConnected = false;
-		m_NextSeq = 0;
-		m_Dying = false;
-		m_OutQueue.clear();
+		m_SerialNo = serial;
+		m_Password = passwd;
 
-		if (m_Sock != 0)
-		{
-#ifdef _MSC_VER
-			closesocket(m_Sock);
-#else
-			close(m_Sock);
-#endif
-			m_Sock = 0;
-		}
+		srand((uint32_t)time(NULL));
+
+		MD5_CTX ctx;
+		MD5_Init(&ctx);
+		MD5_Update(&ctx, (char*)m_Password.c_str(), (unsigned int)m_Password.length());
+		MD5_Final(m_HashedPW, &ctx);
+
+		memset(&m_DestAddr, 0, sizeof(sockaddr_in));
+		m_DestAddr.sin_family = AF_INET;
+		m_DestAddr.sin_port = htons(serverPort);
+		inet_pton(AF_INET, serverIP.c_str(), &m_DestAddr.sin_addr);
+		int64_t s = atoll(serial.c_str());
+		m_SerialQ = htonll(s);
+
+		Disconnect();
+
 		m_ClientToken = rand() | (rand() << 16);
 		m_Sock = socket(AF_INET, SOCK_DGRAM, 0);
 
 		char rcvBuf[512];
 
-		LOG_F(INFO, "Connecting to %s:%d...", s_ServerAddr.c_str(), s_ServerPort);
+		LOG_F(INFO, "Connecting to %s:%d...", serverIP.c_str(), serverPort);
 
 		AuthIntro intro(m_ClientToken, m_SerialQ);
 		sendto(m_Sock, (const char*)&intro, 56, 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
-
+		
 		int bytesReceived = RecvWithTimeout(rcvBuf, sizeof(rcvBuf), 2000);
 
 		if (bytesReceived == 0)
 		{
 			LOG_F(ERROR, "Server not responding, disconnecting");
 			Disconnect();
-			return false;
+			return;
 		}
 
 		AuthChallenge* challenge = (AuthChallenge*)rcvBuf;
@@ -313,7 +308,7 @@ public:
 		{
 			LOG_F(ERROR, "Invalid auth challenge packet (pump offline?), disconnecting");
 			Disconnect();
-			return false;
+			return;
 		}
 
 		m_CSID = challenge->hdr.csid;
@@ -321,8 +316,6 @@ public:
 		m_ServerToken = challenge->serverToken;
 
 		LOG_F(INFO, "Received handshake, CSID=%08X, DSID=%08X, server token %08X", m_CSID, m_DSID, m_ServerToken);
-
-		MD5_CTX ctx;
 
 		MD5_Init(&ctx);
 		MD5_Update(&ctx, &m_ClientToken, 4);
@@ -341,7 +334,7 @@ public:
 		{
 			LOG_F(ERROR, "Server not responding to auth response, disconnecting");
 			Disconnect();
-			return false;
+			return;
 		}
 
 		uint32_t act = *(uint32_t*)(&rcvBuf[sizeof(PacketHeader)]);
@@ -349,66 +342,27 @@ public:
 		{
 			LOG_F(ERROR, "Server returned error in auth, disconnecting");
 			Disconnect();
-			return false;
+			return;
 
 		}
-		m_IsConnected = true;
 		m_LastPacketRcvTime = std::chrono::system_clock::now();
-
-		m_WorkerThread = std::thread(&AlsavoSession::ThreadProc, this);
+		UpdateConnectionStatus(ConnectionStatus::Connected);
 
 		LOG_F(INFO, "Connection complete.");
 
-		if (s_ConfigIndex != -1 && s_ConfigValue != -1)
-		{
-			SetConfig(s_ConfigIndex, s_ConfigValue);
-		}
-
-		if (s_Listen)
-		{
-			// These packets seem to make the heat pump send periodic updates, no idea which one of these does it
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x0c, 0, 7, 0, 4, 0, 1, 0, 0 });
-
-			SendPacket({ 8, 3, 0, 0, 0, 1, 0, 7, 0, 2, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0, 0, 1, 0, 3, 0, 0x64, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 9, 0, 1, 0, 1, 0, 0 });
-
-			SendPacket({ 0x08, 0x13, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x64, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x04, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x05, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x05, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x08, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x03, 0x00, 0x09, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00,
-	0x00, 0x01, 0x00, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00,
-	0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00
-				});
-
-			SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x2e, 0xff, 0xff, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 5, 0, 3, 0, 0 });
-
-			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 3, 0, 0 });
-		}
-		else
-			QueryAll();
-
-		return true;
+		return;
 	}
 
 	void Disconnect()
 	{
 		LOG_F(INFO, "Disconnecting.");
-		m_Dying = true;
-		m_IsConnected = false;
-		if (m_WorkerThread.joinable() && std::this_thread::get_id() != m_WorkerThread.get_id())
-			m_WorkerThread.join();
+		if (m_ConnectionStatus == ConnectionStatus::Connected)
+		{
+			SendPacketNow({ 0x07, 0, 0, 0 }, 0, false, 0xf3);
+		}
+		UpdateConnectionStatus(ConnectionStatus::Disconnected);
+		m_NextSeq = 0;
+		m_OutQueue.clear();
 		if (m_Sock != 0)
 		{
 #ifdef _MSC_VER
@@ -420,181 +374,178 @@ public:
 		}
 	}
 
-	void SetConfig(int16_t idx, int16_t val)
+	void SetConfig(int16_t idx, int16_t val, PacketResponseCB onComplete)
 	{
 		unsigned char idxH = HIBYTE(idx);
 		unsigned char idxL = idx & 0xff;
 		unsigned char valH = HIBYTE(val);
 		unsigned char valL = val & 0xff;
-		SendPacket({9, 1, 0, 0, 0, 2, 0, 0x2e, 0, 2, 0, 0x4, idxH, idxL, valH, valL });
+		SendPacket({9, 1, 0, 0, 0, 2, 0, 0x2e, 0, 2, 0, 0x4, idxH, idxL, valH, valL }, onComplete);
 	}
 
-	void QueryAll()
+	void QueryAll(PacketResponseCB onComplete)
 	{
-		SendPacket({8, 1, 0, 0, 0, 2, 0, 0x2e, 0xff, 0xff, 0, 0});
+		SendPacket({8, 1, 0, 0, 0, 2, 0, 0x2e, 0xff, 0xff, 0, 0}, onComplete);
 		m_LastConfigReqTime = std::chrono::system_clock::now();
 	}
 
-	void CheckAlive()
+	typedef std::function<void(ConnectionStatus newStatus, ConnectionStatus oldStatus)> ConnectionStatusCB;
+
+	void SetConnectionStatusHandler(ConnectionStatusCB cb)
 	{
-		if (isConnected())
-		{
-			auto now = std::chrono::system_clock::now();
-			auto diff = std::chrono::duration<double>(now - m_LastPacketRcvTime.load());
-			if (diff.count() > 6.0)
-			{
-//				LOG_F(INFO, "No packets received in 6 seconds, sending keepalive query packet...");
-				// Send a keepalive packet
-//				SendPacket({ 8, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0 });
-				QueryAll();
-			}
-			if (diff.count() > 20.0)
-			{
-				LOG_F(ERROR, "Connection timed out, disconnecting.");
-				Disconnect();
-			}
-			if (std::chrono::duration<double>(now - m_LastConfigReqTime).count() > 30.0)
-				QueryAll();
-		}
-
-		if (!isConnected())
-		{
-			Disconnect();
-			Connect();
-		}
-
+		m_ConnStatusCB = cb;
 	}
 
-	bool isConnected() { return m_IsConnected; }
+	typedef std::function<void(const std::vector<unsigned char>&, int)> PacketHandlerCB;
 
-	void AddHandler(uint32_t action, std::function<void(const std::vector<unsigned char>&, int)> func)
+	void SetStatusPacketHandler(PacketHandlerCB func)
 	{
-		std::lock_guard<std::recursive_mutex> lock(m_QueueLock);
-		m_Handlers.insert(std::make_pair(action, func));
-	}
-
-	void ClearHandler(uint32_t action)
-	{
-		std::lock_guard<std::recursive_mutex> lock(m_QueueLock);
-		m_Handlers.erase(action);
+		m_StatusHandler = func;
 	}
 
 private:
 
-	std::recursive_mutex m_QueueLock;
-	std::deque<std::vector<unsigned char> > m_OutQueue;
-
-	std::map<char, std::function<void(const std::vector<unsigned char> &, int)> > m_Handlers;
-
-	std::atomic<bool> m_Dying;
-	std::thread m_WorkerThread;
-	int16_t m_LastReplySeq = -1;
-	void ThreadProc()
+	ConnectionStatus m_ConnectionStatus;
+	struct PacketQueueItem
 	{
-		int numRetries = 0;
-		bool dontRetryYet = false;
-		while (!m_Dying.load())
+		PacketQueueItem(std::vector<unsigned char> pkt, PacketResponseCB cb)
+			: packetPayload(pkt)
+			, onResponse(cb)
+			, m_LastSendTime{}
+			, numRetries(0)
 		{
-			int16_t lastSentSeq = 0;
-			if(!dontRetryYet)
+		}
+		std::vector<unsigned char> packetPayload;
+		PacketResponseCB onResponse;
+		std::chrono::time_point<std::chrono::system_clock> m_LastSendTime;
+		int numRetries;
+	};
+
+	ConnectionStatusCB m_ConnStatusCB;
+
+	void UpdateConnectionStatus(ConnectionStatus newStatus)
+	{
+		auto oldStat = m_ConnectionStatus;
+		m_ConnectionStatus = newStatus;
+		if (m_ConnStatusCB && oldStat != newStatus)
+			m_ConnStatusCB(newStatus, oldStat);
+	}
+
+
+	std::deque<PacketQueueItem> m_OutQueue;
+
+	PacketHandlerCB m_StatusHandler;
+
+	std::chrono::duration<float, std::milli> m_PacketTimeout {1000.0f};
+
+public:
+	void Pump()
+	{
+		if (!m_OutQueue.empty())
+		{
+			auto& outPkt = m_OutQueue.front();
+			auto now = std::chrono::system_clock::now();
+			if (now - outPkt.m_LastSendTime > m_PacketTimeout)
 			{
-				std::lock_guard<std::recursive_mutex> lock(m_QueueLock);
-				if (!m_OutQueue.empty())
+				// Timed out (or hasn't even been sent yet), re-send
+				if (outPkt.numRetries > m_MaxRetries)
 				{
-					std::vector<unsigned char> &outBuf = m_OutQueue.front();
-					PacketHeader* hdr = (PacketHeader*)outBuf.data();
-					hdr->seq = m_NextSeq;
-					lastSentSeq = m_NextSeq;
-					numRetries++;
-					uint32_t action = *(uint32_t*)(outBuf.data() + sizeof(PacketHeader));
-//					printf("Sending seq %d, retry %d action: %08x\n", m_NextSeq, numRetries, ntohl(action));
-					sendto(m_Sock, (char *)outBuf.data(), (int)outBuf.size(), 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
-				}
-			}
-			dontRetryYet = false;
-#ifdef _MSC_VER
-			TIMEVAL timeout;
-#else
-			struct timeval timeout;
-#endif
-			timeout.tv_sec = 0;
-			timeout.tv_usec = m_TimeoutMS * 1000;
-			fd_set readSet;
-			FD_ZERO(&readSet);
-			FD_SET(m_Sock, &readSet);
-			int act = select(FD_SETSIZE, &readSet, NULL, NULL, &timeout);
-			if (act > 0)
-			{
-				std::vector<unsigned char> rcvBuf;
-				rcvBuf.resize(1024);
-				sockaddr_in rcvAddr;
-				int rcvLen = sizeof(sockaddr_in);
-
-				int bytesReceived = recvfrom(m_Sock, (char *)rcvBuf.data(), (int)rcvBuf.size(), 0, (sockaddr*)&rcvAddr, (socklen_t *)&rcvLen);
-
-				if (bytesReceived > 0)
-				{
-					m_LastPacketRcvTime = std::chrono::system_clock::now();
-					std::lock_guard<std::recursive_mutex> lock(m_QueueLock);
-					PacketHeader* hdr = (PacketHeader *)rcvBuf.data();
-					if (hdr->isReply())
-					{
-//						printf("Got reply seq %d\n", hdr->seq);
-						if (hdr->seq == lastSentSeq)
-						{
-							// Got reply, can discard the queue head
-							if (!m_OutQueue.empty())
-							{
-								m_OutQueue.pop_front();
-								m_NextSeq++;
-							}
-							numRetries = 0;
-						}
-					}
-					else
-						dontRetryYet = true;
-
-					char action = 0;
-					if (bytesReceived >= sizeof(PacketHeader) + 4)
-					{
-						action = *(char*)(rcvBuf.data() + sizeof(PacketHeader));
-					}
-					// Check for connection reset
-					if (action == 0x7)
-					{
-						// Connection reset
-						LOG_F(ERROR, "Received connection reset packet, disconnecting.");
-						Disconnect();
-						return;
-					}
-
-
-					auto itr = m_Handlers.find(action);
-					if (itr == m_Handlers.end())
-						itr = m_Handlers.find(0);
-					if (itr != m_Handlers.end())
-						itr->second(rcvBuf, bytesReceived);
-
+					LOG_F(ERROR, "No reply received after %d retries, disconnecting", m_MaxRetries);
+					Disconnect();
+					return;
 				}
 
+				std::vector<unsigned char>& outBuf = outPkt.packetPayload;
+				PacketHeader* hdr = (PacketHeader*)outBuf.data();
+				hdr->seq = m_NextSeq;
+				outPkt.numRetries++;
+				uint32_t action = *(uint32_t*)(outBuf.data() + sizeof(PacketHeader));
+				//					printf("Sending seq %d, retry %d action: %08x\n", m_NextSeq, numRetries, ntohl(action));
+				sendto(m_Sock, (char*)outBuf.data(), (int)outBuf.size(), 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
+				outPkt.m_LastSendTime = now;
 			}
-			if (numRetries > m_MaxRetries)
-			{
-				LOG_F(ERROR, "No reply received after %d retries, disconnecting", numRetries);
-				Disconnect();
-				return;
-			}
-
-
 
 		}
+#ifdef _MSC_VER
+		TIMEVAL timeout;
+#else
+		struct timeval timeout;
+#endif
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 200 * 1000;
+		fd_set readSet;
+		FD_ZERO(&readSet);
+		FD_SET(m_Sock, &readSet);
+		int act = select(FD_SETSIZE, &readSet, NULL, NULL, &timeout);
+		if (act > 0)
+		{
+			std::vector<unsigned char> rcvBuf;
+			rcvBuf.resize(1024);
+			sockaddr_in rcvAddr;
+			int rcvLen = sizeof(sockaddr_in);
+
+			int bytesReceived = recvfrom(m_Sock, (char *)rcvBuf.data(), (int)rcvBuf.size(), 0, (sockaddr*)&rcvAddr, (socklen_t *)&rcvLen);
+
+			if (bytesReceived > 0)
+			{
+				m_LastPacketRcvTime = std::chrono::system_clock::now();
+				PacketHeader* hdr = (PacketHeader *)rcvBuf.data();
+
+				char action = 0;
+				if (bytesReceived >= sizeof(PacketHeader) + 4)
+				{
+					action = *(char*)(rcvBuf.data() + sizeof(PacketHeader));
+				}
+				// Check for connection reset
+				if (action == 0x7)
+				{
+					// Connection reset
+					LOG_F(ERROR, "Received connection reset packet, disconnecting.");
+					Disconnect();
+					return;
+				}
+
+				if (hdr->isReply())
+				{
+//					printf("Got reply seq %d\n", hdr->seq);
+					// Got reply, can discard the queue head
+					if (!m_OutQueue.empty())
+					{
+						auto& pkt = m_OutQueue.front();
+						PacketHeader* phdr = (PacketHeader*)pkt.packetPayload.data();
+						if (phdr->seq == hdr->seq)
+						{
+							pkt.onResponse(rcvBuf, bytesReceived);
+							m_OutQueue.pop_front();
+						}
+						else
+						{
+							LOG_F(ERROR, "Expected reply seq %d, got %d instead, disconnecting", phdr->seq, hdr->seq);
+							Disconnect();
+							return;
+						}
+						m_NextSeq++;
+					}
+				}
+				else
+				{
+					if(m_StatusHandler)
+						m_StatusHandler(rcvBuf, bytesReceived);
+				}
+
+			}
+
+		}
+
 	}
+
+	private:
 #ifdef _MSC_VER
 	SOCKET m_Sock{ 0 };
 #else
 	int m_Sock{ 0 };
 #endif
-	bool m_IsConnected = false;
+
 
 	sockaddr_in m_DestAddr;
 
@@ -612,9 +563,8 @@ private:
 	int16_t m_NextSeq = 0;
 
 	int m_MaxRetries = 3;
-	int m_TimeoutMS = 500;
 
-	std::atomic<std::chrono::time_point<std::chrono::system_clock>> m_LastPacketRcvTime;
+	std::chrono::time_point<std::chrono::system_clock> m_LastPacketRcvTime;
 	std::chrono::time_point<std::chrono::system_clock> m_LastConfigReqTime;
 
 };
@@ -625,13 +575,16 @@ class Runner
 {
 public:
 	AlsavoSession m_Session;
-
+	// List of status indices that are temperatures (should be divided by 10)
 	std::set<int> m_TemperatureStatusIndices{ 16, 17, 18, 19, 20, 21, 23, 24, 55, 56 };
+	std::chrono::time_point<std::chrono::system_clock> m_PrevKeepaliveSendTime;
 
 	Runner()
-		: m_Session	(s_SerialNumber, s_Password)
+		: m_Session	()
 	{
 	}
+
+	bool m_OperationsDone = false;
 
 	void HandleParamBlock(ParamBlock* block, bool isConfigs)
 	{
@@ -691,16 +644,19 @@ public:
 				obj = (QueryObject*)(((char *)obj)+dataSize + 8);
 			}
 
-			if(cmd == 0x0b)
-				m_Session.SendReply({ 0x0b, 0x01, 0, 0, 0, 2, 0, 0x2e, 0, payload[9], 0, 0 }, hdr->seq);
+			if (cmd == 0x0b)
+			{
+				if(!s_Listen)
+					m_Session.SendPacketNow({ 7, 0, 0, 0 }, hdr->seq, true, 0xf3);
+				else
+					m_Session.SendPacketNow({ 0x0b, 0x01, 0, 0, 0, 2, 0, 0x2e, 0, payload[9], 0, 0 }, hdr->seq, true);
+			}
 
-			if (!s_Listen && cmd == 0x08 && objectCount == 3) // We got reply to query all and we're not in listen mode, quit.
+/*			if (!s_Listen && cmd == 0x08 && objectCount == 3) // We got reply to query all and we're not in listen mode, quit.
 			{
 				// Disconnect
-				m_Session.SendPacket({ 0x07, 0, 0, 0 }, 0xf3, true);
-				fflush(stdout);
-				exit(0);
-			}
+				m_OperationsDone = true;
+			}*/
 		}
 
 /*		if (cmd == 0x09 && !s_Listen)
@@ -717,19 +673,80 @@ public:
 
 	int main()
 	{
-		m_Session.AddHandler(0, [this](const std::vector<unsigned char> &packet, int byteCount){	DefaultHandler(packet, byteCount);	});
+		m_Session.SetStatusPacketHandler([this](const std::vector<unsigned char>& packet, int byteCount) {	DefaultHandler(packet, byteCount);	});
 
-		m_Session.Connect(); 
-
-		while(1)
+		for (int i = 0; i < 3; ++i)
 		{
-#ifdef _MSC_VER
-			Sleep(1000);
-#else
-			sleep(1);
-#endif
-			m_Session.CheckAlive();
+			m_Session.Connect(s_ServerAddr, s_ServerPort, s_SerialNumber, s_Password);
+			if (m_Session.GetConnectionStatus() == AlsavoSession::ConnectionStatus::Connected)
+				break;
 		}
+		if (m_Session.GetConnectionStatus() != AlsavoSession::ConnectionStatus::Connected)
+			return -1;
+
+		m_PrevKeepaliveSendTime = std::chrono::system_clock::now();
+
+		if (s_ConfigIndex != -1 && s_ConfigValue != -1)
+		{
+			m_Session.SetConfig(s_ConfigIndex, s_ConfigValue, [this](const std::vector<unsigned char>& packet, int byteCount) {	DefaultHandler(packet, byteCount); });
+		}
+		m_Session.QueryAll([this](const std::vector<unsigned char>& packet, int byteCount)
+			{
+				DefaultHandler(packet, byteCount);
+//				if (!s_Listen)
+//					m_OperationsDone = true;
+			});
+
+		/*
+		if (s_Listen)
+		{
+			// These packets seem to make the heat pump send periodic updates, no idea which one of these does it
+			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0 });
+
+			SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x0c, 0, 7, 0, 4, 0, 1, 0, 0 });
+
+			SendPacket({ 8, 3, 0, 0, 0, 1, 0, 7, 0, 2, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0, 0, 1, 0, 3, 0, 0x64, 0, 0 });
+
+			SendPacket({ 8, 1, 0, 0, 0, 9, 0, 1, 0, 1, 0, 0 });
+
+			SendPacket({ 0x08, 0x13, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x64, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x04, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x05, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x05, 0x00, 0x64, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x08, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x03, 0x00, 0x09, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00,
+	0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00
+				});
+
+			SendPacket({ 8, 1, 0, 0, 0, 2, 0, 0x2e, 0xff, 0xff, 0, 0 });
+
+			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 0xc, 0, 0 });
+
+			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 5, 0, 3, 0, 0 });
+
+			SendPacket({ 8, 1, 0, 0, 0, 1, 0, 3, 0, 3, 0, 0 });
+		}
+		else
+			QueryAll();
+			*/
+
+		std::chrono::duration<float, std::milli> keepaliveTimeout{ 2000.0f };
+
+		while(!m_OperationsDone && (m_Session.GetConnectionStatus() == AlsavoSession::ConnectionStatus::Connected))
+		{
+			m_Session.Pump();
+			if (std::chrono::system_clock::now() - m_PrevKeepaliveSendTime > keepaliveTimeout)
+			{
+				m_Session.SendPacket({ 1, 0, 0, 0 }, [](const std::vector<unsigned char>& packet, int byteCount) {}, 0xf3);
+				m_PrevKeepaliveSendTime = std::chrono::system_clock::now();
+			}
+		}
+		m_Session.Disconnect();
+
 		return 0;
 	}
 
@@ -745,6 +762,7 @@ int main(int argc, char **argv)
 	app.add_option("-a,--address", s_ServerAddr, "Override server address, defaults to 47.254.157.150");
 	app.add_option("-p,--port", s_ServerPort, "Override server port, default 51194");
 	app.add_flag("--listen", s_Listen, "Keep listening for status updates");
+	app.add_flag("--silence", s_Silence, "Tap the brakes; set target temp to the current water out temp (rounded to nearest C) + 1, send power off + wait 2.5 seconds + power on");
 	app.add_option("-g,--logfile", logFile, "Write log to file");
 	app.add_option("conf_idx", s_ConfigIndex, "Config index to write");
 	app.add_option("value", s_ConfigValue, "Value to write");
