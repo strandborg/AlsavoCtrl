@@ -611,7 +611,7 @@ public:
 			if(isConfigs)
 			{
 				m_CurrConfigs[i] = valInt;
-				printf("{\"type\":\"config\", \"index\":%d, \"value\":%d}\n", i, valInt);
+				printf("/home/alsavo/config/%d={\"type\":\"config\", \"index\":%d, \"value\":%d}\n",i, i, valInt);
 			}
 			else
 			{
@@ -619,10 +619,10 @@ public:
 				if (m_TemperatureStatusIndices.find(i) != m_TemperatureStatusIndices.end())
 				{
 					float fval = ((float)valInt) / 10.0f;
-					printf("{\"type\":\"status\", \"index\":%d, \"value\":%.1f}\n", i, fval);
+					printf("/home/alsavo/status/%d={\"type\":\"status\", \"index\":%d, \"value\":%.1f}\n", i, i, fval);
 				}
 				else
-					printf("{\"type\":\"status\", \"index\":%d, \"value\":%d}\n", i, valInt);
+					printf("/home/alsavo/status/%d={\"type\":\"status\", \"index\":%d, \"value\":%d}\n", i, i, valInt);
 			}
 		}
 
@@ -701,7 +701,7 @@ public:
 				else if (!s_Listen)
 					m_OperationsDone = true;
 			});
-		std::chrono::duration<float, std::milli> silenceTimeout{ 2500.0f };
+		std::chrono::duration<float, std::milli> silenceTimeout{ 3000.0f };
 
 
 		std::chrono::duration<float, std::milli> keepaliveTimeout{ 2000.0f };
