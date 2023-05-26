@@ -3,6 +3,20 @@
 
 This command-line tool can be used to control pool heat pumps manufactured by Zealux (rebranded as Swim&Fun etc), replacing the "Alsavo Pro" Android/iOS application. Only tested on one specific heat pump; use at your own risk.
 
+# Building from sources
+
+The example build system uses cmake, at least version 3.10. In addition you'll need a C++ compiler (for example g++) installed.
+
+Clone the repository in a directory, and from that directory, run the following commands:
+```
+mkdir build
+cd build
+cmake ..
+make
+```
+
+After those commands you should have a 'AlsavoCtrl' executable in the build dir.
+
 # Usage
 ```
 Usage: AlsavoCtrl [OPTIONS] [conf_idx] [value]
