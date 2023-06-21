@@ -17,6 +17,10 @@ make
 
 After those commands you should have a 'AlsavoCtrl' executable in the build dir.
 
+# Docker image
+
+Peter Haislund has created a readymade [Docker image](https://hub.docker.com/r/peterhaislund/alsavo_status) that can be used to publish the status values to MQTT. 
+
 # Usage
 ```
 Usage: AlsavoCtrl [OPTIONS] [conf_idx] [value]
