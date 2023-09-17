@@ -40,6 +40,7 @@ static std::string s_SerialNumber;
 static std::string s_Password;
 static bool s_Listen = false;
 static bool s_Silence = false;
+static bool s_JSONOutput = false;
 static int s_ConfigIndex = -1;
 static int s_ConfigValue = -1;
 #pragma pack(1)
@@ -602,7 +603,16 @@ public:
 		if (!isConfigs && numParams + startIdx > m_CurrStatuses.size())
 			m_CurrStatuses.resize(numParams + startIdx);
 
+		if(s_JSONOutput)
+		{
+			// Header
+			if(isConfigs)
+				printf("\"config\": {\n");
+			else
+				printf("\"status\": {\n");
+		}
 
+		bool hasPrev = false;
 		for (int i = startIdx; i < startIdx + numParams; ++i)
 		{
 			int16_t valInt = ntohs(block->payload[i - startIdx]);
@@ -611,19 +621,56 @@ public:
 			if(isConfigs)
 			{
 				m_CurrConfigs[i] = valInt;
-				printf("/home/alsavo/config/%d={\"type\":\"config\", \"index\":%d, \"value\":%d}\n",i, i, valInt);
+				if(s_JSONOutput)
+				{
+					if(hasPrev)
+						printf(",\n");
+					printf("\"%d\" : %d", i, valInt);
+					hasPrev = true;
+				}
+				else
+				{
+					printf("/home/alsavo/config/%d={\"type\":\"config\", \"index\":%d, \"value\":%d}\n",i, i, valInt);
+				}
 			}
 			else
 			{
 				m_CurrStatuses[i] = valInt;
-				if (m_TemperatureStatusIndices.find(i) != m_TemperatureStatusIndices.end())
+				if(s_JSONOutput)
 				{
-					float fval = ((float)valInt) / 10.0f;
-					printf("/home/alsavo/status/%d={\"type\":\"status\", \"index\":%d, \"value\":%.1f}\n", i, i, fval);
+					if(hasPrev)
+						printf(",\n");
+					printf("\"%d\" : ", i);
+					if (m_TemperatureStatusIndices.find(i) != m_TemperatureStatusIndices.end())
+					{
+						float fval = ((float)valInt) / 10.0f;
+						printf("%.1f", fval);
+					}
+					else
+						printf("%d", valInt);
+					
+					hasPrev = true;
+
+
 				}
 				else
-					printf("/home/alsavo/status/%d={\"type\":\"status\", \"index\":%d, \"value\":%d}\n", i, i, valInt);
+				{
+					if (m_TemperatureStatusIndices.find(i) != m_TemperatureStatusIndices.end())
+					{
+						float fval = ((float)valInt) / 10.0f;
+						printf("/home/alsavo/status/%d={\"type\":\"status\", \"index\":%d, \"value\":%.1f}\n", i, i, fval);
+					}
+					else
+						printf("/home/alsavo/status/%d={\"type\":\"status\", \"index\":%d, \"value\":%d}\n", i, i, valInt);
+				}
 			}
+		}
+		if(s_JSONOutput)
+		{
+			printf("\n}");
+			if(!isConfigs) // Status is printed out first
+				printf(",");
+			printf("\n");
 		}
 
 	}
@@ -685,6 +732,8 @@ public:
 		{
 			m_Session.SetConfig(s_ConfigIndex, s_ConfigValue, [this](const std::vector<unsigned char>& packet, int byteCount) {	DefaultHandler(packet, byteCount); });
 		}
+		if(s_JSONOutput)
+			printf("{\n");
 		m_Session.QueryAll([this](const std::vector<unsigned char>& packet, int byteCount)
 			{
 				DefaultHandler(packet, byteCount);
@@ -734,6 +783,8 @@ public:
 				m_PrevKeepaliveSendTime = std::chrono::system_clock::now();
 			}*/
 		}
+		if(s_JSONOutput)
+			printf("}\n");
 		m_Session.Disconnect();
 
 		return 0;
@@ -752,6 +803,7 @@ int main(int argc, char **argv)
 	app.add_option("-p,--port", s_ServerPort, "Override server port, default 51194");
 	app.add_flag("--listen", s_Listen, "Keep listening for status updates, not very reliable");
 	app.add_flag("--silence", s_Silence, "Tap the brakes; set target temp to the current water out temp (rounded to nearest C) + 1, send power off + wait 2.5 seconds + power on");
+	app.add_flag("--json", s_JSONOutput, "JSON output");
 	app.add_option("-g,--logfile", logFile, "Write log to file");
 	app.add_option("conf_idx", s_ConfigIndex, "Config index to write");
 	app.add_option("value", s_ConfigValue, "Value to write");
