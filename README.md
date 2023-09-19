@@ -19,7 +19,10 @@ After those commands you should have a 'AlsavoCtrl' executable in the build dir.
 
 # Docker image
 
-Peter Haislund has created a readymade [Docker image](https://hub.docker.com/r/peterhaislund/alsavo_status) that can be used to publish the status values to MQTT. 
+The included Docker image can be used to create an image that publishes the status and configurable values to MQTT using the Homie 4.0 convention. Based on Peter Haislund's Docker image.
+
+Alternatively, Peter Haislund has created a readymade [Docker image](https://hub.docker.com/r/peterhaislund/alsavo_status) that can be used to publish the status values to MQTT. 
+
 
 # Usage
 ```
@@ -37,6 +40,7 @@ Options:
   -p,--port INT               Override server port, default 51194
   --listen                    Keep listening for status updates
   -g,--logfile TEXT           Write log to file
+  --json                      Output in more easily parseable JSON format
   ```
 
 Running AlsavoCtrl without config_idx and value will query the current status and config values as JSON and exit. 
