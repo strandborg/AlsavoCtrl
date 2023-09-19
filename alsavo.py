@@ -82,7 +82,10 @@ class Device_Alsavo(Device_Base):
 
     def update_json(self):
         response = subprocess.check_output([alsavoctrl_exe, "--json", "-s", alsavo_serial, "-l", alsavo_pass, "-a", alsavo_ip, "-p", alsavo_port], text=True, universal_newlines=True)
-        self.state_json = json.loads(response)
+        try:
+            self.state_json = json.loads(response)
+        except Exception as e:
+            print(f"Failed to parse AlsavoCtrl results: {e}")
 
     def setConfig(self, config, newVal):
         subprocess.check_output([alsavoctrl_exe, "--json", "-s", alsavo_serial, "-l", alsavo_pass, "-a", alsavo_ip, "-p", alsavo_port, str(config), str(newVal)], text=True, universal_newlines=True)
@@ -90,7 +93,7 @@ class Device_Alsavo(Device_Base):
 
 
     def addTempMeasurement(self, status_idx, id, name):
-        prop = Property_Temperature(self.node, id=id, name=name, unit="C", value=20)
+        prop = Property_Temperature(self.node, id=id, name=name, unit="°C", value=20)
         self.node.add_property(prop)
         self.statuses.append((status_idx, prop))
 
@@ -100,7 +103,7 @@ class Device_Alsavo(Device_Base):
         self.statuses.append((status_idx, prop))
 
     def addSetpointConfig(self, config_idx, id, name):
-        prop = Property_Setpoint(self.node, id=id, name=name, unit="C", set_value=lambda newTemp: self.setConfig(config_idx, int(newTemp*10)))
+        prop = Property_Setpoint(self.node, id=id, name=name, unit="°C", set_value=lambda newTemp: self.setConfig(config_idx, int(newTemp*10)))
         prop.read_transform = lambda inVal: float(inVal/10)
         self.node.add_property(prop)
         self.configs.append((config_idx, prop))
