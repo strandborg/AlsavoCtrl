@@ -39,7 +39,7 @@ COPY --from=build \
     ./app/
 
 # Install the paho-mqtt library
-RUN pip install Homie4
+RUN pip install paho-mqtt==1.6.1 Homie4
 
 # Run the Python script with environment variables
 CMD ["python", "alsavo.py"]
