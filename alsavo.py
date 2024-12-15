@@ -30,7 +30,7 @@ alsavoctrl_exe = os.environ.get("ALSAVO_CTRL_PATH", "./AlsavoCtrl")
 device_id = os.environ.get("MQTT_DEVICE_BASE", "alsavo")
 device_name = os.environ.get("MQTT_DEVICE_NAME", "Alsavo")
 
-mqtt_publish_interval = os.environ.get("MQTT_PUBLISH_INTERVAL", 120)
+mqtt_publish_interval = int(os.environ.get("MQTT_PUBLISH_INTERVAL", 120))
 
 class Device_Alsavo(Device_Base):
     def __init__(
