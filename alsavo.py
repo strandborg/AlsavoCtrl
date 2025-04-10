@@ -26,6 +26,7 @@ alsavo_port = os.environ.get("ALSAVO_PORT", "51192")
 alsavo_serial = os.environ.get("ALSAVO_SERIAL", None)
 alsavo_pass = os.environ.get("ALSAVO_PASS", None)
 alsavoctrl_exe = os.environ.get("ALSAVO_CTRL_PATH", "./AlsavoCtrl")
+alsavo_verbosity = os.environ.get("ALSAVO_VERBOSITY", "WARNING")
 
 device_id = os.environ.get("MQTT_DEVICE_BASE", "alsavo")
 device_name = os.environ.get("MQTT_DEVICE_NAME", "Alsavo")
@@ -81,7 +82,7 @@ class Device_Alsavo(Device_Base):
         self.start()
 
     def update_json(self):
-        response = subprocess.check_output([alsavoctrl_exe, "--json", "-s", alsavo_serial, "-l", alsavo_pass, "-a", alsavo_ip, "-p", alsavo_port], text=True, universal_newlines=True)
+        response = subprocess.check_output([alsavoctrl_exe, "-v", alsavo_verbosity, "--json", "-s", alsavo_serial, "-l", alsavo_pass, "-a", alsavo_ip, "-p", alsavo_port], text=True, universal_newlines=True)
         try:
             self.state_json = json.loads(response)
         except Exception as e:

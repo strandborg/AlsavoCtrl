@@ -43,6 +43,8 @@ static bool s_Silence = false;
 static bool s_JSONOutput = false;
 static int s_ConfigIndex = -1;
 static int s_ConfigValue = -1;
+static std::string s_verbosity;
+
 #pragma pack(1)
 struct PacketHeader
 {
@@ -807,6 +809,7 @@ int main(int argc, char **argv)
 	app.add_option("-g,--logfile", logFile, "Write log to file");
 	app.add_option("conf_idx", s_ConfigIndex, "Config index to write");
 	app.add_option("value", s_ConfigValue, "Value to write");
+	app.add_option("-v", s_verbosity, "Set verbosity level (0-3)");
 
 	CLI11_PARSE(app, argc, argv);
 
