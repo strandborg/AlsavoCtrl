@@ -564,7 +564,7 @@ public:
 	uint32_t m_CSID = 0;
 	uint32_t m_DSID = 0;
 
-	int16_t m_NextSeq = 0;
+	int32_t m_NextSeq = 0;
 
 	int m_MaxRetries = 3;
 
