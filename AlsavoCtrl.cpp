@@ -266,7 +266,7 @@ private:
 		return bytesReceived;
 	}
 public:
-	void Connect(const std::string serverIP, int16_t serverPort, const std::string &serial, const std::string &passwd)
+	void Connect(const std::string serverIP, uint16_t serverPort, const std::string &serial, const std::string &passwd)
 	{
 		m_SerialNo = serial;
 		m_Password = passwd;
@@ -294,19 +294,49 @@ public:
 
 		LOG_F(INFO, "Connecting to %s:%d...", serverIP.c_str(), serverPort);
 
-		AuthIntro intro(m_ClientToken, m_SerialQ);
-		sendto(m_Sock, (const char*)&intro, 56, 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
-		
-		int bytesReceived = RecvWithTimeout(rcvBuf, sizeof(rcvBuf), 2000);
-
-		if (bytesReceived == 0)
-		{
-			LOG_F(ERROR, "Server not responding, disconnecting");
-			Disconnect();
-			return;
-		}
-
 		AuthChallenge* challenge = (AuthChallenge*)rcvBuf;
+		int bytesReceived = 0;
+
+		// The server can answer with action 6: redirect to another server (u32 IP, u16 port, both big endian).
+		// Address 0:0 means the pump is offline.
+		for (int redirects = 0; ; ++redirects)
+		{
+			AuthIntro intro(m_ClientToken, m_SerialQ);
+			sendto(m_Sock, (const char*)&intro, 56, 0, (sockaddr*)&m_DestAddr, sizeof(m_DestAddr));
+
+			bytesReceived = RecvWithTimeout(rcvBuf, sizeof(rcvBuf), 2000);
+
+			if (bytesReceived <= 0)
+			{
+				LOG_F(ERROR, "Server not responding, disconnecting");
+				Disconnect();
+				return;
+			}
+
+			if (challenge->act1 != 6 || bytesReceived < (int)sizeof(PacketHeader) + 10)
+				break;
+
+			uint32_t ip;
+			uint16_t port;
+			memcpy(&ip, rcvBuf + sizeof(PacketHeader) + 4, 4);
+			memcpy(&port, rcvBuf + sizeof(PacketHeader) + 8, 2);
+			if (ip == 0 && port == 0)
+			{
+				LOG_F(ERROR, "Server reports the pump is offline, disconnecting");
+				Disconnect();
+				return;
+			}
+			if (redirects == 3)
+			{
+				LOG_F(ERROR, "Too many server redirects, disconnecting");
+				Disconnect();
+				return;
+			}
+			m_DestAddr.sin_addr.s_addr = ip;
+			m_DestAddr.sin_port = port;
+			const unsigned char* b = (const unsigned char*)&ip;
+			LOG_F(INFO, "Server redirected us to %u.%u.%u.%u:%u", b[0], b[1], b[2], b[3], ntohs(port));
+		}
 
 		if (!(challenge->act1 == 3 && challenge->act2 == 0 && challenge->act3 == 0 && challenge->act4 == 0))
 		{
@@ -334,7 +364,7 @@ public:
 
 		bytesReceived = RecvWithTimeout(rcvBuf, sizeof(rcvBuf), 2000);
 
-		if (bytesReceived == 0)
+		if (bytesReceived <= 0)
 		{
 			LOG_F(ERROR, "Server not responding to auth response, disconnecting");
 			Disconnect();

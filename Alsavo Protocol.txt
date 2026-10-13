@@ -3,19 +3,91 @@ In LAN mode, the heat pump answers to UDP port 1194. In global mode, server IP i
 
 All traffic is in big endian.
 
-Packet header format:
-int8    header code: 0x32 = request, 0x30 = reply to an earlier request of the same sequence number
-int8    padding
-int8    sequence number (monotonically increasing once session has been set up, otherwise 0)
+Sources: packet captures, and static analysis of the Alsavo Pro 1.8 APK (Java: com.gwcd.htchp, com.galaxywind.clib.ClibZlycjInfo;
+native: libclib_jni.so, a GalaxyWind "clib" SDK; the vendor name in the code is "Zlycj"). Names in [brackets] are from the app code.
+
+Packet header format (16 bytes):
+int8    header byte: bits 7-5 = protocol version (1), bits 4-2 = header length in 32-bit words (4 = 16 bytes),
+        bit 1 = request (1) / reply (0), bit 0 = payload is encrypted.
+        So 0x32 = request, 0x30 = reply, 0x33/0x31 = encrypted. The app also knows a version 2 header (0x58 base, 24 bytes,
+        extra u32 request id at offset 16), but it uses it only for "share code" logins.
+int8    flags. Bit 0 set = "accept this request even if the request id is out of sequence".
+int8    request id (sequence number). The receiver accepts a request with id == last or last+1. A reply carries the id of its request.
+int8    zero
 int32   csid (session identifier, provided by server at login)
 int32   dsid (device identifier, provided by server at login)
-int16   command category: 0xf2 = login and authentication messages, 0xf3 = status and keepalive, 0xf4 = normal commands once session has been set update
+int16   command: 0xf2 = authentication, 0xf3 = keepalive, 0xf4 = commands once the session is up.
+        The app also handles 0xf5, 0xf6 (same handler as 0xf4), 0x7f, 0x104 (share code register) and 0x12e/0x137 (wifi device packets).
 int16   payload length in bytes (the length of the rest of the packet)
-int8    "action" = command. 8 = Object query, 9 = set object value, 7 = connection reset (cmd == 0xf3 in this case), 0xb = status update from server (initiated by the server, client needs to reply)
+int8    "action" = first byte of the payload.
+
+Encryption: when the header bit 0 is set, everything from offset 12 (command, length, payload) is encrypted.
+Type 1 = AES (PKCS7 padding to 16 bytes), type 2 = TEA (padding to 8 bytes). The server selects the type in the auth result.
+Session key = MD5(clientToken, serverToken, MD5(password), MD5(password)).
+The cloud server has always selected type 0 (no encryption) for us. AlsavoCtrl does not implement encryption.
 
 
-Different payloads:
-1, 2, 3, 4, 5: Authentication messages. Look into source code to see the contents.
+Authentication (cmd 0xf2)
+==========================
+Action 1, client -> server [auth request], payload length 0x28:
+  int8   1
+  int8   flags (bit 0 set)
+  int8   2  (constant in the app. A sibling client in the same library puts 1 or 2 here for "phone session" or not,
+            so this is probably a client type. Inferred.)
+  int8   0
+  int32  client token (random number, sent raw)
+  int64  pump serial number
+  16 bytes  client UUID (the phone's UUID; any value works)
+  8 bytes   timestamp: int16 year, int8 month (1-12), int8 day, int8 hour, int8 min, int8 sec (UTC), int8 time zone
+
+Action 3, server -> client [auth question]: payload[4..7] = server token. The csid and dsid in this header are the session values.
+  If payload length >= 32, payload[1] == 2 and payload[2] == 0, payload[24..31] is a "share code" that replaces the password.
+
+Action 6, server -> client [redirect]: payload[4..7] = IPv4 address, payload[8..9] = port. The client must restart the login
+  at that address. Address 0 and port 0 = the device is offline [ULGE_DEV_OFF_LINE].
+  AlsavoCtrl follows up to 3 redirects. Before this, it rejected the redirect as an "Invalid auth challenge packet" (GitHub issue #23).
+
+Action 4, client -> server [auth answer], payload length 0x1c:
+  int8   4
+  int8   flags (bit 0 = answer uses share code)
+  int16  3  (supported encryption types: bit 0 = AES, bit 1 = TEA; inferred)
+  16 bytes  MD5(clientToken, serverToken, MD5(password))   (or the 8-byte share code instead of MD5(password))
+  8 bytes   timestamp, same format as above
+
+Action 5, server -> client [auth result], payload length >= 12:
+  int8   5
+  int8   ?
+  int16  encryption type for the session (0 = none, 1 = AES, 2 = TEA)
+  int16  result: 0 = OK. The app maps it to its login error codes [ULGE_*]:
+         3 = bad password [ULGE_BAD_PASSWORD]. 0x4c = error 15 (no name in the app; the app retries with a backup password).
+         0x59 = clone device [ULGE_CLONE_DEV]. Other values pass through unchanged, so probably:
+         1 = bad serial [ULGE_BAD_SN], 5 = need bind, 6 = full bind, 7 = bound to other user, 9 = server busy.
+  int16  ?
+  int8   device type, int8 ext type, int8 login type, int8 net type
+  then TLVs (int16 type, int16 length, data):
+    1 = vendor string, 3 = timer parameters (see below), 0x10 = time zone (int32), 0x13 = share code (8 bytes), others unknown
+
+Action 7 on cmd 0xf3 from the server at any time = reset the session. The client must log in again.
+
+
+Keepalive and timers (cmd 0xf3)
+================================
+Client sends action 1 (payload 1,0,0,0) when it has no other request in flight. Server replies action 2, with optional TLVs
+from payload[4] (type 3 = timer parameters). Action 7 = session reset.
+
+Timer parameter set: 3 retry delays (in 100 ms), keepalive interval (s), session die timeout (s). App defaults:
+  LAN direct:      300/1000/1000 ms, keepalive 3 s, die 10 s   (100/300/300 ms in a fast app mode)
+  Cloud (fg):      1/2/3 s,       keepalive 20 s, die 300 s
+  Cloud (bg):      1/5/10 s,      keepalive 120 s, die 300 s
+A request is retried with retry1, retry2, then retry3 for each later try. After 50 tries the app drops the session.
+The auth step times out after 15 s. TLV 3 (24 bytes) = 4 sets of {int8 r1, int8 r2, int8 r3, int8 keepalive, int16 die}.
+
+
+Different payloads (cmd 0xf4):
+8: object query / response [get]
+9: set object value [set]
+0xb: status push from the device [push], the client must reply.
+
 
 8: object query / response
 ===============
@@ -25,8 +97,9 @@ int16   pad
 <object payloads, starting with object header>
 
 Object header:
-int32 object type: only known one is 0x0002002e for status/config data.
-int16 object subtype: for status/configs 1 = status, 2 = configs, 3 = deviceInfo?, 0xffff queries for all params and configs.
+int16 object type: 0x0002
+int16 sub-object type: 0x002e for the heat pump data. (Older notes read these two as one int32 0x0002002e.)
+int16 attribute: 1 = status, 2 = config, 0xffff = query all. (3 = deviceInfo? not used by the heat pump code in the app.)
 int16 object payload size. For queries this is 0, responses have payload data after this one.
 
 For param/config data the object payload layout:
@@ -34,9 +107,30 @@ int16 startIdx
 int16 numIndices
 <numIndices x int16> parameter values. See below for param/config indices
 
+The app accepts status data only with startIdx 16 (up to 53 values, indices 16..68)
+and config data only with startIdx 1 (up to 34 values, indices 1..34).
+
+9: set object value
+====================
+Same header as 8: int8 9, int8 1, int16 0, then object 0x0002/0x002e, attribute 2, size = 4 x N,
+then N pairs of (int16 config index, int16 value). The app can set several indices in one packet; the highest valid index is 34.
+The reply (action 9) carries a 2-byte object payload: int16 result, 0 = OK.
+
 0xb: Status update
 ===================
 Layout identical to command 8, except that this is sent periodically by the server, containing status params (basically 0xb, 1, 0, 0, followed by object header for 0x0002002e with subtype 1)
+The client replies with cmd 0xf4, header byte 0x30, the same request id, payload: 0xb, 1, 0, 0, then the first object header with size 0.
+
+
+LAN discovery
+=============
+The app broadcasts a 28-byte probe from UDP port 8819..8868 to port 8818:
+  int64 serial number, 8 zero bytes, int16 1, int16 4, int32 0, int8 1, int8 2, int16 ?
+A device that answers is logged in to directly. The login port is 1194 for devices that use this UDP protocol
+[user->is_udp_ctrl], else 1181 (older device family).
+Reply (type 2): int64 serial, int64 client id (0), int16 type (2), int16 length (from offset 24), int32 ?,
+then int8 ? (offset 24), int8 sub type (25), 8+8 bytes (28..43), int16 (44), int8 ext type (46),
+then TLVs (int16 type, int16 length) from offset 48: 0x0e = smart-config success time, 0x22 = 32-byte developer id, others unknown.
 
 
 
@@ -44,70 +138,159 @@ Status params:
 
 Values are signed int16s.
 All temperature values are in tenths of a Celsius, for example a value of -123 means -12.3 degrees C.
+Names in [brackets] are the ZLYCJ_STAT_* constants from the app.
 
-16 = Water in temp
-17 = Water out temp
-18 = Ambient temperature
-19 = "Cold pipe temperature"
-20 = "Heating pipe temperature"
-21 = IPM module temperature
-22 = Fan speed (RPM)
-23 = Exhaust temperature
-24 = Compressor input temperature? Always zero for me.
-25 = Electronic exhaust valve opening setting, Range: 0-450'ish
-26 = Compressor current in amps
-27 = Compressor running frequency
-33 = Compressor speed setting (0 = off, 1 = P1 40Hz, 5 = P5 82Hz)
-34 = Frequency limit code
-48 = Alarm code 1
-49 = Alarm code 2
-50 = Alarm code 3
-51 = Alarm code 4
-52 = System status code (0 in heating operation)
-53 = System running code (3 = heating operation, 2 = defrost)
-54 = Device status code (231 = heating operation, 175 = defrost)
-55 = Heating max temperature
-56 = Cooling min temperature
-64 = Device type
-65 = Main board HW revision
-66 = Main board SW revision
-67 = Manual HW code
-68 = Manual SW code
+16 = Water in temp [IN_TEMP]
+17 = Water out temp [OUT_TEMP]
+18 = Ambient temperature [ENV_TEMP]
+19 = "Cold pipe temperature" [COLD_TUBE_TEMP]
+20 = "Heating pipe temperature" [HOT_TUBE_TEMP]. The app shows it as "coil temperature".
+21 = IPM module temperature [IPM_TEMP]
+22 = Fan speed (RPM) [DC_FAN_SPEED]
+23 = Exhaust (compressor discharge) temperature, circuit 1 [PRESS1_OUT_TEMP]
+24 = Gas return (compressor suction) temperature, circuit 1 [PRESS1_IN_TEMP]. Always zero for me.
+25 = Electronic expansion valve opening, circuit 1, in steps [EEV1_STEP]. Range: 0-450'ish
+26 = Compressor current in amps, circuit 1 [COMPRESSOR1_CURRENT]
+27 = Compressor running frequency, circuit 1 [COMPRESSOR1_RFEQ]
+28 = Exhaust temperature, circuit 2 [PRESS2_OUT_TEMP]
+29 = Gas return temperature, circuit 2 [PRESS2_IN_TEMP]
+30 = EEV opening, circuit 2 [EEV2_STEP]
+31 = Compressor current, circuit 2 [COMPRESSOR2_CURRENT]
+32 = Compressor running frequency, circuit 2 [COMPRESSOR2_RFEQ]
+    (28-32 are for two-compressor models. The app reads them but does not show them.)
+33 = Compressor speed setting [NOW_FREQ] (0 = off, 1 = P1 40Hz, 5 = P5 82Hz)
+34 = Frequency limit code [FREQ_LIMIT_CODE]
+48 = Alarm code 1 [ALARM1] (bit field, see below)
+49 = Alarm code 2 [ALARM2]
+50 = Alarm code 3 [ALARM3]
+51 = Alarm code 4 [ALARM4] (the app does not use it)
+52 = System status code [SYS] (0 in all samples for one year, so possibly a fault code)
+53 = System running code [SYS_RUNNING]:
+     0 = off (the water pump can run after a stop or for frost protection)
+     1 = on, compressor off (the 5-minute water pump run before start, or target temperature reached)
+     2 = defrost
+     3 = heating
+     Cooling mode was not seen.
+54 = Device status code [DEV], a bit field of outputs and flags (see below)
+55 = Heating max temperature [HOT_MAX_LIMIT]
+56 = Cooling min temperature [COLD_LOW_LIMIT]
+64 = Device type [DEV_TYPE]:
+     0 = inverter, heat/cool/auto [FREQALL]
+     1 = fixed speed, heat only [SIGNLE]
+     2 = fixed speed, heat/cool [FIXCH]
+     3 = inverter, heat/cool [FREQCH]
+     4 = fixed speed, heat/cool/auto [FIXALL]
+     Types 0 and 3 are "inverter" (frequency) models in the app. The mode button cycles through 3 modes for types 0 and 4,
+     2 modes (cool/heat) for types 2 and 3, and heat only for type 1.
+65 = Main board HW revision [MAIN_BOARD_HW_CODE]
+66 = Main board SW revision [MAIN_BOARD_SOFT_CODE]
+67 = Manual HW code [MANUAL_HW_CODE] (probably the wired controller, "manual operator")
+68 = Manual SW code [MANUAL_SOFT_CODE]
+
+Status 52-54: the app copies these values but does not use them. The meanings below come from one year of
+openHAB history of one heat pump (15-minute samples, and 1-minute samples for 6 days). They are inferred.
+
+Status 54 bits:
+  bit 0 (0x01) = Compressor. Set only when the compressor frequency is above 0. (high confidence)
+  bit 1 (0x02) = Unknown. Always the same as bit 0 in the data.
+  bit 2 (0x04) = Probably the crankcase heater. Set before the compressor starts in cold air, clear 3 minutes
+                 after the start. Set during defrost. Set more often when the coil is colder. (medium)
+  bit 3 (0x08) = Outdoor fan. Clear while the fan stops in defrost. Stays set 1 minute after the compressor stops. (high)
+  bit 4 (0x10) = Frost protection while the compressor is off. Always set below -2 C air, never above 4 C. (medium)
+  bit 5 (0x20) = Water pump. Set first at start, clear last (4-5 minutes) after a stop. (high)
+  bit 6 (0x40) = 4-way (reversing) valve. Set only in defrost. Probably also set in cooling mode. (high)
+  bit 7 (0x80) = Low air temperature flag, or the base pan heater. Set only while the compressor runs.
+                 Always set below 6 C air, almost never above 10 C. (medium)
+Typical values: 43 = heating, mild air; 171/175 = heating, cold air; 231 = defrost; 239/111 = end of defrost;
+40 then 32 = fan, then water pump, still on after a stop; 16/48 = frost protection.
+Start sequence: 32 or 36 (run code 1), then 5 minutes later 43/47/175 (run code 3), then 171 or 43.
+Defrost sequence: 175 -> 231 -> 239 or 111 -> 47 -> 175.
+
+Alarm bits, inverter models (device type 0 or 3), in the order the app shows them:
+  Alarm2 bit 0-7  = PP01-PP08: water in sensor, water out sensor, heating pipe sensor, gas return sensor,
+                    ambient sensor, exhaust sensor, antifreeze protection in winter, low ambient temperature protection
+  Alarm2 bit 9    = PP10 Piping temperature too high in cooling mode
+  Alarm2 bit 10   = PP11 Water temperature (T2) too low in cooling mode
+  Alarm1 bit 0    = EE01 High pressure failure
+  Alarm1 bit 1    = EE02 Low pressure failure
+  Alarm1 bit 2    = EE03 No water flow or water flow switch failure
+  Alarm1 bit 3    = EE04 Water temperature (T2) overheat in heating mode
+  Alarm1 bit 4    = EE05 Exhaust temperature (T6) too high
+  Alarm1 bit 5    = EE06 Controller malfunction or communication failure
+  Alarm1 bit 6    = EE07 Compressor current protection
+  Alarm1 bit 7    = EE08 Communication failure between controller and main board
+  Alarm1 bit 8    = EE09 Communication failure between main board and driver board
+  Alarm1 bit 9    = EE10 VDC voltage too high
+  Alarm1 bit 10   = EE11 IPM module protection
+  Alarm1 bit 11   = EE12 VDC voltage too low
+  Alarm1 bit 12   = EE13 Input current too high
+  Alarm1 bit 14   = EE14 IPM module thermal circuit abnormal
+  Alarm1 bit 15   = EE15 IPM module temperature too high
+  Alarm2 bit 11   = EE16 PFC module protection
+  Alarm1 bit 13   = EE17 DC fan motor failure
+  Alarm2 bit 12   = EE18 PFC module thermal circuit abnormal
+  Alarm2 bit 13   = EE19 PFC module high temperature
+  Alarm2 bit 14   = EE20 Input power failure
+  Alarm2 bit 15   = EE21 Software control exception
+  Alarm3 bit 0    = EE22 Current detection circuit failure
+  Alarm3 bit 1    = EE23 Compressor startup failed
+  Alarm3 bit 2    = EE24 Ambient temperature device failure on driver board
+  Alarm3 bit 3    = EE25 Compressor phase failure
+  Alarm3 bit 4    = EE26 4-way valve reversal failure
+  Alarm3 bit 5    = EE27 EEPROM data read malfunction
+  Alarm3 bit 6    = EE28 Inter-chip communication failure on the main control board
+
+Alarm bits, fixed speed models (other device types):
+  Alarm2 bit 0-7  = PP1-PP8: water in sensor, water out sensor, heating pipe sensor, gas return sensor, ambient sensor,
+                    water in/out temperature difference protection, cooling water too cold / antifreeze, exhaust sensor
+  Alarm1 bit 0    = EE1 High pressure failure
+  Alarm1 bit 1    = EE2 Low pressure failure
+  Alarm1 bit 2    = EE3/ON No water flow or water flow switch failure
+  Alarm1 bit 3    = EE4 Power supply connection wrong (3 phase)
+  Alarm1 bit 4    = EE5 Water in/out temperature difference malfunction
+  Alarm1 bit 7    = EE8 Communication failure between controller and main board
+
 
 Config params:
+Names in [brackets] are the ZLYCJ_CONFIG_* constants from the app. Ranges are the limits in the app UI.
 
-1 = Heating mode target temp
-2 = Cooling mode target temp
-3 = Auto mode target temp
-4 = System config bitmask 1 (See below)
-5 = System config bitmask 2 (See below)
-6 = Manual frequency setting
-7 = Manual EEV setting
-8 = Manual fan speed setting
-9 = Defrost in temp
-10 = Defrost out temp (Heating pipe temperature required to end defrost)
-11 = Water temperature calibration (offset for all temperature measurements)
-12 = Defrost in time (minimum time between defrost sequences, in minutes)
-13 = Defrost out time (max defrost time?)
-14 = "Hot over", looks like temperature, but without x10? Default value 30
-15 = "Cold over" default -20
-16 = Power mode (0 = silent, 1 = smart 2 = powerful)
-17 = Unknown, default value 6
-32 = Current time, hibyte=hours, lobyte=minutes
-33 = Timer on time
-34 = Timer off time
+1 = Heating mode target temp [HOT_TEMP] (x10. App: 15-41 C inverter, 15-42 C fixed speed)
+2 = Cooling mode target temp [COLD_TEMP] (x10. App: 6-35 C)
+3 = Auto mode target temp [AUTO_TEMP] (x10. App: 6-41/42 C)
+4 = System config bitmask 1 [SYS1] (See below)
+5 = System config bitmask 2 [SYS2] (See below)
+6 = Manual frequency setting [P9_FREQ]
+7 = Manual EEV setting [P10_ELE_OPENING]
+8 = Manual fan speed setting [P11_DC_FAN_SPEED]
+9 = Defrost in temp [DEFROST_IN_TEMP] (x10. App: -30..0 C)
+10 = Defrost out temp [DEFROST_OUT_TEMP] (Heating pipe temperature required to end defrost. x10. App: 2..30 C)
+11 = Water temperature calibration [T1_WATER_COMPENSATION] (offset for the water in temperature, x10. App: -9.0..+9.0 C)
+12 = Defrost in time [DEFROST_IN_TIME] (minimum time between defrost sequences, in minutes. App: 30-90)
+13 = Defrost out time [DEFROST_OUT_TIME] (max defrost time in minutes. App: 1-12)
+14 = "Hot over" [HOT_OVER]: "Superheat for heating target" (EEV superheat target), x10. App: -15..15 C. Default 30 = 3.0 C
+15 = "Cold over" [COLD_OVER]: "Superheat for cooling target", x10. App: -15..15 C. Default -20 = -2.0 C
+16 = Power mode [FREQ_MODE] (0 = silent, 1 = smart 2 = powerful. App labels: low/mid/high). Inverter models only.
+     The app forces 1 when the mode is auto.
+17 = Unknown, default value 6. Indices 17-31 have no name in the app. The native code stores and sends indices 0-34 without
+     any special case, so the APK cannot tell what they are.
+32 = Current time [NOW_TIME], hibyte=hours, lobyte=minutes
+33 = Timer on time [TIMER_ON], hibyte=hours, lobyte=minutes
+34 = Timer off time [TIMER_OFF], hibyte=hours, lobyte=minutes
 
 Sys config 1:
 
 Bits 0-1:   Operating mode: 0 = cool, 1 = heat, 2 = Auto
-Bit 2:      Timer on enabled
+Bit 2:      Timer on enabled. On inverter models this bit enables both timers.
 Bit 3:      Water pump running mode (see manual, 0 = heat pump controls water pump, 1 = always on)
-Bit 4:      Electronic Valve style ?
+Bit 4:      Electronic expansion valve mode ("Mode selection of Electronic expansion valve", read-only in the app, 0/1)
 Bit 5:      On/off
 Bit 6:      Debug mode (0 = auto, 1 = manual config C6, C7, C8 in effect)
-Bit 7:      Timer off enabled
+Bit 7:      Timer off enabled (fixed speed models only)
 
 Sys config 2:
 Bit 0:      Manual Defrost
-Bit 1:      Reset to factory settings OR set Valve mode, you'll never know!
-Bit 2:
+Bit 1:      Reset to factory settings. The app uses this same bit for both "valve mode" and "restore factory" (ControlApi.setVavleMode
+            and ControlApi.restoreFactory), so the app itself does not separate them.
+Bit 2:      Unknown. The app never reads or writes sys2 bits other than bit 1.
+
+The app hides the parameter page behind the installer password "0757".
