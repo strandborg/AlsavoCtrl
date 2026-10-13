@@ -72,8 +72,8 @@ All temperature values are in tenths of a Celsius, for example a value of -123 m
 50 = Alarm code 3
 51 = Alarm code 4
 52 = System status code (0 in heating operation)
-53 = System running code (3 = heating operation, 2 = defrost)
-54 = Device status code (231 = heating operation, 175 = defrost)
+53 = System running code (0 = off, 1 = on but compressor off, 2 = defrost, 3 = heating)
+54 = Device status code, a bit field (see "Alsavo Protocol.txt"; 175 = heating in cold air, 231 = defrost)
 55 = Heating max temperature
 56 = Cooling min temperature
 64 = Device type

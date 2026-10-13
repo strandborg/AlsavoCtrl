@@ -164,9 +164,14 @@ Names in [brackets] are the ZLYCJ_STAT_* constants from the app.
 49 = Alarm code 2 [ALARM2]
 50 = Alarm code 3 [ALARM3]
 51 = Alarm code 4 [ALARM4] (the app does not use it)
-52 = System status code [SYS] (0 in heating operation)
-53 = System running code [SYS_RUNNING] (3 = heating operation, 2 = defrost)
-54 = Device status code [DEV] (231 = heating operation, 175 = defrost)
+52 = System status code [SYS] (0 in all samples for one year, so possibly a fault code)
+53 = System running code [SYS_RUNNING]:
+     0 = off (the water pump can run after a stop or for frost protection)
+     1 = on, compressor off (the 5-minute water pump run before start, or target temperature reached)
+     2 = defrost
+     3 = heating
+     Cooling mode was not seen.
+54 = Device status code [DEV], a bit field of outputs and flags (see below)
 55 = Heating max temperature [HOT_MAX_LIMIT]
 56 = Cooling min temperature [COLD_LOW_LIMIT]
 64 = Device type [DEV_TYPE]:
@@ -181,6 +186,25 @@ Names in [brackets] are the ZLYCJ_STAT_* constants from the app.
 66 = Main board SW revision [MAIN_BOARD_SOFT_CODE]
 67 = Manual HW code [MANUAL_HW_CODE] (probably the wired controller, "manual operator")
 68 = Manual SW code [MANUAL_SOFT_CODE]
+
+Status 52-54: the app copies these values but does not use them. The meanings below come from one year of
+openHAB history of one heat pump (15-minute samples, and 1-minute samples for 6 days). They are inferred.
+
+Status 54 bits:
+  bit 0 (0x01) = Compressor. Set only when the compressor frequency is above 0. (high confidence)
+  bit 1 (0x02) = Unknown. Always the same as bit 0 in the data.
+  bit 2 (0x04) = Probably the crankcase heater. Set before the compressor starts in cold air, clear 3 minutes
+                 after the start. Set during defrost. Set more often when the coil is colder. (medium)
+  bit 3 (0x08) = Outdoor fan. Clear while the fan stops in defrost. Stays set 1 minute after the compressor stops. (high)
+  bit 4 (0x10) = Frost protection while the compressor is off. Always set below -2 C air, never above 4 C. (medium)
+  bit 5 (0x20) = Water pump. Set first at start, clear last (4-5 minutes) after a stop. (high)
+  bit 6 (0x40) = 4-way (reversing) valve. Set only in defrost. Probably also set in cooling mode. (high)
+  bit 7 (0x80) = Low air temperature flag, or the base pan heater. Set only while the compressor runs.
+                 Always set below 6 C air, almost never above 10 C. (medium)
+Typical values: 43 = heating, mild air; 171/175 = heating, cold air; 231 = defrost; 239/111 = end of defrost;
+40 then 32 = fan, then water pump, still on after a stop; 16/48 = frost protection.
+Start sequence: 32 or 36 (run code 1), then 5 minutes later 43/47/175 (run code 3), then 171 or 43.
+Defrost sequence: 175 -> 231 -> 239 or 111 -> 47 -> 175.
 
 Alarm bits, inverter models (device type 0 or 3), in the order the app shows them:
   Alarm2 bit 0-7  = PP01-PP08: water in sensor, water out sensor, heating pipe sensor, gas return sensor,
